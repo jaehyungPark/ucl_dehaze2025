@@ -76,7 +76,7 @@ class CustomDatasetDataLoader():
             self.dataset,
             batch_size=opt.batch_size,
             shuffle=not opt.serial_batches,
-            num_workers=0,
+            num_workers=2,
             drop_last=True if opt.isTrain else False,
         )
 

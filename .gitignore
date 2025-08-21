@@ -1,0 +1,10 @@
+# dirs
+checkpoints/
+datasets/
+results/
+
+# all nested __pycache__
+**/__pycache__/
+
+# local utils
+check_gpu.py

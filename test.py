@@ -3,7 +3,8 @@
 Once you have trained your model with train.py, you can use this script to test the model.
 It will load a saved model from --checkpoints_dir and save the results to --results_dir.
 
-It first creates model and dataset given the option. It will hard-code some parameters.
+It first creates model and dataset given the option. 
+It will hard-code some parameters.
 It then runs inference for --num_test images and save results to an HTML file.
 
 Example (You need to train models first or download pre-trained models from our website):
@@ -27,29 +28,51 @@ See training and test tips at: https://github.com/junyanz/pytorch-CycleGAN-and-p
 See frequently asked questions at: https://github.com/junyanz/pytorch-CycleGAN-and-pix2pix/blob/master/docs/qa.md
 """
 import os
+# 핵심 모듈 
 from options.test_options import TestOptions
 from data import create_dataset
 from models import create_model
+# util 모듈 
 from util.visualizer import save_images
 from util import html
 import util.util as util
 
+##### Before running #####
+""" 
+To view training results and loss plots, run:
+
+python -m visdom.server
+
+and click the URL http://localhost:8097 
+"""
 
 if __name__ == '__main__':
     opt = TestOptions().parse()  # get test options
+
     # hard-code some parameters for test
-    opt.num_threads = 0   # test code only supports num_threads = 1
-    opt.batch_size = 1    # test code only supports batch_size = 1
-    opt.serial_batches = True  # disable data shuffling; comment this line if results on randomly chosen images are needed.
-    opt.no_flip = True    # no flip; comment this line if results on flipped images are needed.
-    opt.display_id = -1   # no visdom display; the test code saves the results to a HTML file.
-    dataset = create_dataset(opt)  # create a dataset given opt.dataset_mode and other options
-    train_dataset = create_dataset(util.copyconf(opt, phase="train"))
-    model = create_model(opt)      # create a model given opt.model and other options
+    opt.num_threads = 0
+        # test code only supports num_threads = 1
+    opt.batch_size = 1
+        # test code only supports batch_size = 1
+    opt.serial_batches = True
+        # disable data shuffling; comment this line if results on randomly chosen images are needed.
+    opt.no_flip = True
+        # no flip; comment this line if results on flipped images are needed.
+    opt.display_id = -1
+        # no visdom display; the test code saves the results to a HTML file.
+    dataset = create_dataset(opt)
+        # create a dataset given opt.dataset_mode and other options
+    # train_dataset = create_dataset(util.copyconf(opt, phase="train"))
+    model = create_model(opt)
+        # create a model given opt.model and other options
+
     # create a webpage for viewing the results
-    web_dir = os.path.join(opt.results_dir, opt.name, '{}_{}'.format(opt.phase, opt.epoch))  # define the website directory
+    web_dir = os.path.join(opt.results_dir, opt.name, '{}_{}'.format(opt.phase, opt.epoch))     # define the website directory
     print('creating web directory', web_dir)
     webpage = html.HTML(web_dir, 'Experiment = %s, Phase = %s, Epoch = %s' % (opt.name, opt.phase, opt.epoch))
+    """
+    필요시 수정 
+    """
 
     for i, data in enumerate(dataset):
         if i == 0:
@@ -64,7 +87,10 @@ if __name__ == '__main__':
         model.test()           # run inference
         visuals = model.get_current_visuals()  # get image results
         img_path = model.get_image_paths()     # get image paths
-        if i % 5 == 0:  # save images to an HTML file
+        if i % 5 == 0:
             print('processing (%04d)-th image... %s' % (i, img_path))
+        
+        # save images to an HTML file
         save_images(webpage, visuals, img_path, width=opt.display_winsize)
+
     webpage.save()  # save the HTML

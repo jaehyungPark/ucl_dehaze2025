@@ -1,10 +1,20 @@
 import time
 import torch
+# 핵심 모듈 
 from options.train_options import TrainOptions
 from data import create_dataset
 from models import create_model
+# util 모듈 
 from util.visualizer import Visualizer
 
+##### Before running #####
+""" 
+To view training results and loss plots, run:
+
+python -m visdom.server
+
+and click the URL http://localhost:8097 
+"""
 
 if __name__ == '__main__':
     opt = TrainOptions().parse()   # get training options
@@ -38,6 +48,7 @@ if __name__ == '__main__':
             epoch_iter += batch_size
             if len(opt.gpu_ids) > 0:
                 torch.cuda.synchronize()
+                
             optimize_start_time = time.time()
             if epoch == opt.epoch_count and i == 0:
                 model.data_dependent_initialize(data)
@@ -51,7 +62,9 @@ if __name__ == '__main__':
 
             if total_iters % opt.display_freq == 0:   # display images on visdom and save images to a HTML file
                 save_result = total_iters % opt.update_html_freq == 0
-                model.compute_visuals()
+                
+                model.compute_visuals()             # 여기서는 그냥 pass 되는 코드라인인디.. 
+
                 visualizer.display_current_results(model.get_current_visuals(), epoch, save_result)
 
             if total_iters % opt.print_freq == 0:    # print training losses and save logging information to the disk

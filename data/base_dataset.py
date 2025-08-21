@@ -122,6 +122,7 @@ def get_transform(opt, params=None, grayscale=False, method=Image.BICUBIC, conve
         elif 'flip' in params:
             transform_list.append(transforms.Lambda(lambda img: __flip(img, params['flip'])))
 
+    # Tensorization, Normalization(픽셀을 [-1,1] 범위로 정규화)
     if convert:
         transform_list += [transforms.ToTensor()]
         if grayscale:

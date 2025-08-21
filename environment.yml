@@ -1,4 +1,4 @@
-name: UCL-Dehaze
+name: ucl
 channels:
 - pytorch
 - defaults
@@ -14,3 +14,5 @@ dependencies:
   - visdom==0.1.8
   - packaging
   - GPUtil==1.4.0
+
+  # conda create -n ucl python=3.6 

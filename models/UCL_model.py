@@ -6,7 +6,8 @@ from .patchnce import PatchNCELoss
 import util.util as util
 
 # pretrained VGG16 module set in evaluation mode for feature extraction
-vgg = VGGNet().cuda().eval()
+# vgg = VGGNet().cuda().eval()
+    # moved into UCLModel.__init__ with proper device & freezing
 
 
 class UCLModel(BaseModel):
@@ -24,6 +25,7 @@ class UCLModel(BaseModel):
         parser.add_argument('--lambda_GAN', type=float, default=1.0, help='weight for GAN loss：GAN(G(X))')
         parser.add_argument('--lambda_NCE', type=float, default=1.0, help='weight for NCE loss: NCE(G(X), X)')
         parser.add_argument('--lambda_IDT', type=float, default=5.0, help='weight for NCE loss: IDT(G(Y), Y)')
+        parser.add_argument('--lambda_SCP', type=float, default=0.0002, help='weight for SCP loss: vgg-based pixel-wise perceptual contrastive loss')
         parser.add_argument('--nce_idt', type=util.str2bool, nargs='?', const=True, default=True, help='use NCE loss for identity mapping: NCE(G(Y), Y))')
         parser.add_argument('--nce_layers', type=str, default='0,5,9,13,17', help='compute NCE loss on which layers')
         parser.add_argument('--nce_includes_all_negatives_from_minibatch',
@@ -41,16 +43,24 @@ class UCLModel(BaseModel):
 
         opt, _ = parser.parse_known_args()
 
-        parser.set_defaults(nce_idt=True, lambda_NCE=1.0)
+        # Why 하드코딩? 
+        # parser.set_defaults(nce_idt=True, lambda_NCE=1.0)
 
         return parser
 
     def __init__(self, opt):
         BaseModel.__init__(self, opt)
 
+        # VGG for perceptual (SCP) loss: device-safe & frozen
+        self.vgg = VGGNet().to(self.device).eval()
+        for p in self.vgg.parameters():
+            p.requires_grad_(False)
+
         # specify the training losses you want to print out.
         # The training/test scripts will call <BaseModel.get_current_losses>
-        self.loss_names = ['G_GAN', 'D_real', 'D_fake', 'G', 'NCE', 'idt', 'perceptual']
+        # self.loss_names = ['G_GAN', 'D_real', 'D_fake', 'G', 'NCE', 'idt', 'perceptual']
+        self.loss_names = ['D_real', 'D_fake', 'G', 'G_GAN', 'perceptual',
+                            'scp_raw', 'scp_num', 'scp_den', 'idt', 'NCE']  # loss 로깅 수정 (SCP 분해 로깅 및 순서 변경) 
         self.visual_names = ['real_A', 'fake_B', 'real_B']
         self.nce_layers = [int(i) for i in self.opt.nce_layers.split(',')]
 
@@ -91,7 +101,12 @@ class UCLModel(BaseModel):
         Please also see PatchSampleF.create_mlp(), which is called at the first forward() call.
         """
         self.set_input(data)
-        bs_per_gpu = self.real_A.size(0) // max(len(self.opt.gpu_ids), 1)
+        # bs_per_gpu = self.real_A.size(0) // max(len(self.opt.gpu_ids), 1)
+        # 배치=1, GPU=2이면 0이 되어 이후 텐서가 공집합으로 변하는 현상 방지 
+        world = max(len(self.opt.gpu_ids), 1)
+        bs_total = self.real_A.size(0)
+        bs_per_gpu = max(1, bs_total // world)  # 최소 1 보장
+
         self.real_A = self.real_A[:bs_per_gpu]
         self.real_B = self.real_B[:bs_per_gpu]
         self.forward()                     # compute fake images: G(A)
@@ -116,12 +131,16 @@ class UCLModel(BaseModel):
         # update G
         self.set_requires_grad(self.netD, False)
         self.optimizer_G.zero_grad()
-        if self.opt.netF == 'mlp_sample':
+        # if self.opt.netF == 'mlp_sample':
+        # 호출 조건 강화
+        if self.opt.netF == 'mlp_sample' and self.opt.lambda_NCE > 0.0 and hasattr(self, 'optimizer_F'):
             self.optimizer_F.zero_grad()
         self.loss_G = self.compute_G_loss()
         self.loss_G.backward()
         self.optimizer_G.step()
-        if self.opt.netF == 'mlp_sample':
+        # if self.opt.netF == 'mlp_sample':
+        # 호출 조건 강화
+        if self.opt.netF == 'mlp_sample' and self.opt.lambda_NCE > 0.0 and hasattr(self, 'optimizer_F'):
             self.optimizer_F.step()
 
     def set_input(self, input):
@@ -180,32 +199,96 @@ class UCLModel(BaseModel):
             self.loss_NCE, self.loss_NCE_bd = 0.0, 0.0
 
         if self.opt.nce_idt and self.opt.lambda_NCE > 0.0:
-            self.loss_NCE_Y = 0
+            # self.loss_NCE_Y = 0
+            # 0813 수정사항 
+            self.loss_NCE_Y = self.calculate_NCE_loss(self.real_B, self.idt_B)
+
             loss_NCE_both = (self.loss_NCE + self.loss_NCE_Y)
             self.loss_idt = self.criterionIdt(self.idt_B, self.real_B) * self.opt.lambda_IDT       # G(Y) & clear w.CUT/ w.o. FastCUT
         else:
             loss_NCE_both = self.loss_NCE
 
-        self.loss_perceptual = self.perceptual_loss(self.real_A, self.fake_B, self.real_B) * 0.0002     
+            # 안전 가드: nce_idt 비활성 시 idt/NCE_Y는 0으로 정의
+            self.loss_idt = torch.tensor(0.0, device=self.device)
+            if not hasattr(self, 'loss_NCE_Y'):
+                self.loss_NCE_Y = torch.tensor(0.0, device=self.device)
+
+        # self.loss_perceptual = self.perceptual_loss(self.real_A, self.fake_B, self.real_B) * 0.0002
+        self.loss_perceptual = self.perceptual_loss(self.real_A, self.fake_B, self.real_B) * self.opt.lambda_SCP
 
         self.loss_G = self.loss_G_GAN + loss_NCE_both + self.loss_idt + self.loss_perceptual
         return self.loss_G
 
     def perceptual_loss(self, x, y, z):
+        """
+        x: hazy (real_A), y: dehazed (fake_B), z: clear (real_B)
+        """
         # c = torch.nn.MSELoss()
         c = torch.nn.L1Loss()
 
-        fx1, fx2, fx3 = vgg(x)      # hazy  extract
-        fy1, fy2, fy3 = vgg(y)      # dehazed
-        fz1, fz2, fz3 = vgg(z)      # clear
+        # 0813 수정사항 
+        # [SCP 안정화]
+        # - VGG 입력 정규화 보장: perceptual 계산 직전 x,y,z를 [0,1]로 unnormalize 후 ImageNet mean/std로 normalize하여 VGG에 투입 ?
+        # - 분모가 너무 작을 때 ε 안정화: eps = 1e-6
+        # - 필요 시 self.loss_perceptual *= 5~10 배 상향(예: 0.001~0.002 수준 목표) → 논문 표 7에서 SCP가 성능에 크게 기여함이 확인됨.
 
-        m1 = c(fz1, fy1) / c(fx1, fy1)
-        m2 = c(fz2, fy2) / c(fx2, fy2)
-        m3 = c(fz3, fy3) / c(fx3, fy3)
+        eps = 1e-6
 
-        loss = 0.4 * m1 + 0.6 * m2 + m3
-        return loss
+        # VGG 입력 정규화
+        x_vgg = self._prep_for_vgg(x)
+        y_vgg = self._prep_for_vgg(y)
+        z_vgg = self._prep_for_vgg(z)
 
+        # x,z는 상수 취급 (vgg 파라미터는 동결이므로 메모리 절감 가능)
+        with torch.no_grad():
+            fx1, fx2, fx3 = self.vgg(x_vgg)   # hazy features (Rh)
+            fz1, fz2, fz3 = self.vgg(z_vgg)   # clear features (Rc)
+
+        # y는 G로부터 gradient가 흘러야 하므로 no_grad 금지
+        fy1, fy2, fy3 = self.vgg(y_vgg)      # dehazed features (G(x))
+
+        # 비율형 대조 지표 (+ 분모 안정화)
+        # m1 = c(fz1, fy1) / (c(fx1, fy1) + eps)
+        # m2 = c(fz2, fy2) / (c(fx2, fy2) + eps)
+        # m3 = c(fz3, fy3) / (c(fx3, fy3) + eps)
+
+        # loss = 0.4 * m1 + 0.6 * m2 + m3
+        # return loss
+        num1, den1 = c(fz1, fy1), c(fx1, fy1)
+        num2, den2 = c(fz2, fy2), c(fx2, fy2)
+        num3, den3 = c(fz3, fy3), c(fx3, fy3)
+
+        # 스케일 가중합 (논문: 0.4/0.6/1.0)
+        num = 0.4 * num1 + 0.6 * num2 + 1.0 * num3
+        den = 0.4 * den1 + 0.6 * den2 + 1.0 * den3
+        raw = num / (den + eps)   # <-- 가중 전(raw) SCP 값
+
+        # ------- 로깅용 값 보관(학습 그래프 분리) -------
+        # 'loss_' prefix 사용 → 자동 프린트/저장
+        self.loss_scp_raw = raw.detach()
+        self.loss_scp_num = num.detach()
+        self.loss_scp_den = den.detach()
+        # ---------------------------------------------
+
+        return raw
+
+
+    def _prep_for_vgg(self, t: torch.Tensor) -> torch.Tensor:
+        """
+        Input:  t in [-1, 1], shape [B,3,H,W], RGB
+        Output: normalized for ImageNet VGG, shape [B,3,H,W]
+        """
+        # [-1,1] -> [0,1]
+        t = (t + 1.0) * 0.5
+        t = t.clamp(0.0, 1.0)
+
+        # ImageNet mean/std (RGB)
+        mean = torch.tensor([0.485, 0.456, 0.406], device=t.device, dtype=t.dtype).view(1, 3, 1, 1)
+        std  = torch.tensor([0.229, 0.224, 0.225], device=t.device, dtype=t.dtype).view(1, 3, 1, 1)
+
+        # [0,1] -> ImageNet-normalized
+        t = (t - mean) / std
+        return t
 
     def calculate_NCE_loss(self, src, tgt):
         n_layers = len(self.nce_layers)     # CUT: RGB,1,2(downsampling),1,5(resblock)
