@@ -21,7 +21,19 @@ def is_image_file(filename):
     return any(filename.endswith(extension) for extension in IMG_EXTENSIONS)
 
 
+# def make_dataset(dir, max_dataset_size=float("inf")):
+#     images = []
+#     assert os.path.isdir(dir) or os.path.islink(dir), '%s is not a valid directory' % dir
+
+#     for root, _, fnames in sorted(os.walk(dir, followlinks=True)):
+#         for fname in fnames:
+#             if is_image_file(fname):
+#                 path = os.path.join(root, fname)
+#                 images.append(path)
+#     return images[:min(max_dataset_size, len(images))]
+
 def make_dataset(dir, max_dataset_size=float("inf")):
+    import random
     images = []
     assert os.path.isdir(dir) or os.path.islink(dir), '%s is not a valid directory' % dir
 
@@ -30,7 +42,23 @@ def make_dataset(dir, max_dataset_size=float("inf")):
             if is_image_file(fname):
                 path = os.path.join(root, fname)
                 images.append(path)
-    return images[:min(max_dataset_size, len(images))]
+
+    n = len(images)
+    if n == 0:
+        return images
+
+    # max_dataset_size가 무한대이거나 전체보다 크면 전체 반환
+    if max_dataset_size == float("inf") or max_dataset_size >= n:
+        return images
+
+    k = int(max_dataset_size)
+
+    # 재현성: 환경변수로 시드 설정 (예: DATASET_SAMPLE_SEED=42)
+    seed_env = os.environ.get("DATASET_SAMPLE_SEED")
+    rng = random.Random(int(seed_env)) if seed_env is not None else random
+
+    # 무작위로 k개 샘플링(중복 없음)
+    return rng.sample(images, k)
 
 
 def default_loader(path):
