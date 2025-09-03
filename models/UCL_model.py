@@ -5,10 +5,264 @@ from . import networks
 from .patchnce import PatchNCELoss
 import util.util as util
 
-# pretrained VGG16 module set in evaluation mode for feature extraction
-# vgg = VGGNet().cuda().eval()
-    # moved into UCLModel.__init__ with proper device & freezing
 
+## midas 'depth-concat PatchGAN' discriminator integration 
+import torch.nn as nn
+import torch.nn.functional as F
+# -------- MiDaS official wrapper (isl-org/MiDaS) --------
+class MiDaSOfficial(nn.Module):
+    """
+    Uses torch.hub('isl-org/MiDaS', 'DPT_Large') and official transforms.dpt_transform.
+    Expects input as RGB [-1,1] torch tensor [B,3,H,W].
+    """
+    def __init__(self, model_type='DPT_Large', img_size=384, device='cuda'):
+        super().__init__()
+        self.device = device
+        self.img_size = img_size
+
+        # Try new org first, then legacy hub path for robustness.
+        try:
+            self.midas = torch.hub.load('isl-org/MiDaS', model_type).to(device).eval()
+            self.transforms = torch.hub.load('isl-org/MiDaS', 'transforms')
+        except Exception:
+            self.midas = torch.hub.load('intel-isl/MiDaS', model_type).to(device).eval()
+            self.transforms = torch.hub.load('intel-isl/MiDaS', 'transforms')
+
+        # Official transform for DPT models
+        self.transform = self.transforms.dpt_transform
+
+        # Freeze
+        for p in self.midas.parameters():
+            p.requires_grad_(False)
+
+    @torch.no_grad()
+    def forward(self, x_rgb_m11: torch.Tensor) -> torch.Tensor:
+        """
+        x_rgb_m11: [-1,1] RGB, [B,3,H,W]
+        Return: depth [B,1,H,W], min-max normalized per-sample to [0,1]
+        Uses official transform per image (loop).
+        """
+        B, _, H, W = x_rgb_m11.shape
+        # [-1,1] -> [0,1], RGB
+        x01 = (x_rgb_m11 + 1.0) * 0.5
+        x01 = x01.clamp(0, 1)
+
+        # build input batch via official transform (expects HWC uint/float RGB np)
+        inp = []
+        for b in range(B):
+            img = (x01[b].permute(1,2,0).detach().cpu().numpy() * 255.0).astype(np.uint8)  # RGB uint8
+            # official: returns [1,3,384,384] torch.Float
+            tin = self.transform(img)  # already resized/normalized for DPT
+            inp.append(tin)
+
+        input_batch = torch.cat(inp, dim=0).to(self.device)  # [B,3,384,384]
+
+        # predict depth
+        pred = self.midas(input_batch)  # [B,384,384] or [B,1,384,384]
+        if pred.dim() == 3:
+            pred = pred.unsqueeze(1)     # -> [B,1,h,w]
+
+        depth = F.interpolate(pred, size=(H, W), mode='bicubic', align_corners=False)
+
+        # scale-invariant min-max normalize per sample (to [0,1])
+        d_min = depth.amin(dim=(2,3), keepdim=True)
+        d_max = depth.amax(dim=(2,3), keepdim=True)
+        depth_01 = (depth - d_min) / (d_max - d_min + 1e-6)
+        return depth_01
+
+# -------------------------------
+# (A) MiDaS 커스텀 forward 추출기
+# -------------------------------
+class MidasDPTExtractor(nn.Module):
+    """
+    DPT-Large(dpt_large_384) 공식 transform을 사용하여:
+    - 최종 depth (H,W) 1ch  [0,1] 정규화
+    - 중간 refine pyramid features (p1..p4) 반환
+    를 동시에 수행한다.
+    """
+    def __init__(self, model_type='DPT_Large', img_size=384, device='cuda', local_ckpt_path=''):
+        super().__init__()
+        self.device = device
+        self.img_size = img_size
+
+        # 1) 모델/트랜스폼 로드 (허브 우선, 실패시 intel-isl로 폴백)
+        if local_ckpt_path:
+            # ---- 로컬 대안 (옵션) ----
+            # 클론을 PYTHONPATH에 추가 후, 아래 import가 성공해야 함:
+            # from midas.dpt_depth import DPTDepthModel
+            # from midas.transforms import Resize, NormalizeImage, PrepareForNet, Compose
+            # 여기서는 간결성을 위해 torch.hub 경로를 권장. (필요시 내가 로컬 버전 코드도 만들어줄게)
+            raise NotImplementedError("For local ckpt use, ping me to drop-in a local loader variant.")
+        else:
+            try:
+                self.model = torch.hub.load('isl-org/MiDaS', model_type).to(device).eval()
+                self.transforms = torch.hub.load('isl-org/MiDaS', 'transforms')
+            except Exception:
+                self.model = torch.hub.load('intel-isl/MiDaS', model_type).to(device).eval()
+                self.transforms = torch.hub.load('intel-isl/MiDaS', 'transforms')
+
+        # DPT 공식 transform (입력은 numpy HWC RGB 기대)
+        self.transform = self.transforms.dpt_transform
+
+        # 동결
+        for p in self.model.parameters():
+            p.requires_grad_(False)
+
+    @torch.no_grad()
+    def forward(self, x_rgb_m11: torch.Tensor):
+        """
+        x_rgb_m11: [-1,1] RGB, [B,3,H,W]
+        returns:
+          depth_01: [B,1,H,W]  (min-max per-sample normalized)
+          feats: dict with keys {'p1','p2','p3','p4'} (refine outputs), each [B,C,h,w]
+        """
+        B, _, H, W = x_rgb_m11.shape
+
+        # [-1,1] -> [0,1], HWC uint8 for official transform
+        x01 = (x_rgb_m11 + 1.0) * 0.5
+        x01 = x01.clamp(0, 1)
+
+        # build transform batch
+        batch = []
+        for b in range(B):
+            img = (x01[b].permute(1,2,0).detach().cpu().numpy() * 255.0).astype(np.uint8)  # RGB uint8
+            tin = self.transform(img)  # [1,3,384,384] float
+            batch.append(tin)
+        inp = torch.cat(batch, dim=0).to(self.device)  # [B,3,384,384]
+
+        # ----- DPT 내부 경로를 명시적으로 재현 -----
+        try:
+            from midas.blocks import forward_vit
+        except ImportError:
+            import sys
+            sys.path.append("/data/jhpark/MiDaS")  # 직접 clone 한 루트로 
+            from midas.blocks import forward_vit
+        
+        # 1) encoder (pretrained): 4개 스테이지 이미지형 피처
+        l1, l2, l3, l4 = forward_vit(self.model.pretrained, inp)   # shapes: ~1/4, 1/8, 1/16, 1/32
+
+        # 2) reassemble to scratch channels
+        s = self.model.scratch
+        p4 = s.layer4_rn(l4)       # 가장 깊은 단계
+        p3 = s.layer3_rn(l3)
+        p2 = s.layer2_rn(l2)
+        p1 = s.layer1_rn(l1)
+
+        # 3) refine pyramid (top-down progressive fusion)
+        p4 = s.refinenet4(p4)              # 1/32-ish
+        p3 = s.refinenet3(p3, p4)          # 1/16-ish
+        p2 = s.refinenet2(p2, p3)          # 1/8-ish
+        p1 = s.refinenet1(p1, p2)          # 1/4-ish (decoder 최종 feature)
+
+        ## 점검부 
+        # print(l1.shape, l2.shape, l3.shape, l4.shape)   # 대략 1/4, 1/8, 1/16, 1/32 해상도
+        # print(p1.shape, p2.shape, p3.shape, p4.shape)   # refinenet 경로, 주로 256ch
+
+        out = s.output_conv(p1)            # [B,1,h,w]  (h,w≈inp/2)
+        # DPT는 보통 입력의 절반 해상도로 출력하므로, 원 해상도로 업샘플
+        depth = F.interpolate(out, size=(H, W), mode='bicubic', align_corners=False)
+
+        # per-sample min-max 정규화
+        d_min = depth.amin(dim=(2,3), keepdim=True)
+        d_max = depth.amax(dim=(2,3), keepdim=True)
+        depth_01 = (depth - d_min) / (d_max - d_min + 1e-6)
+
+        feats = {'p1': p1, 'p2': p2, 'p3': p3, 'p4': p4}  # decoder refine pyramid
+        return depth_01, feats
+
+# --------------------------------------
+# (B) Depth FPN: p1..p4 -> [B,Cd,H,W]
+# --------------------------------------
+class DepthFPNFuse(nn.Module):
+    """
+    DPT refine pyramid(p1..p4)를 FPN 방식으로 융합.
+    - 각 p_k를 1x1 Conv -> 채널 정렬
+    - top-down 업샘플 + sum
+    - 최종 3x3 Conv로 Cd 채널 출력
+    """
+    def __init__(self, in_ch=256, out_ch=16):
+        super().__init__()
+        # DPT scratch refinenet 출력 채널은 통상 256 (버전에 따라 다르면 아래 1x1을 조정)
+        self.l1 = nn.Conv2d(in_ch, out_ch, 1, 1, 0)
+        self.l2 = nn.Conv2d(in_ch, out_ch, 1, 1, 0)
+        self.l3 = nn.Conv2d(in_ch, out_ch, 1, 1, 0)
+        self.l4 = nn.Conv2d(in_ch, out_ch, 1, 1, 0)
+        self.proj = nn.Sequential(
+            nn.Conv2d(out_ch, out_ch, 3, 1, 1),
+            nn.InstanceNorm2d(out_ch),
+            nn.ReLU(True)
+        )
+
+    def forward(self, feats: dict, target_hw: tuple):
+        """
+        feats: {'p1','p2','p3','p4'}
+        target_hw: (H,W)  최종 해상도
+        returns: depth_feat [B,out_ch,H,W]
+        """
+        p1, p2, p3, p4 = feats['p1'], feats['p2'], feats['p3'], feats['p4']  # p1가 가장 고해상도(≈1/4)
+
+        # 1x1 정렬
+        f1 = self.l1(p1)
+        f2 = self.l2(p2)
+        f3 = self.l3(p3)
+        f4 = self.l4(p4)
+
+        # top-down: f4 -> f3 -> f2 -> f1
+        def up(x, like):
+            return F.interpolate(x, size=like.shape[-2:], mode='bilinear', align_corners=False)
+
+        u3 = f3 + up(f4, f3)
+        u2 = f2 + up(u3, f2)
+        u1 = f1 + up(u2, f1)
+
+        # 최종 target(H,W)로 업샘플 + 정리
+        H, W = target_hw
+        u1 = F.interpolate(u1, size=(H, W), mode='bilinear', align_corners=False)
+        out = self.proj(u1)
+        return out  # [B,out_ch,H,W]
+
+# ---------------------------------------------------
+# (C) DepthFeatConcatD: depth_feat과 RGB concat하는 D
+# ---------------------------------------------------
+class DepthFeatConcatD(nn.Module):
+    """ precomputed depth_feat과 RGB를 concat해서 PatchGAN에 투입 """
+    def __init__(self, base_D):
+        super().__init__()
+        self.D = base_D
+
+    def forward(self, img, depth_feat):
+        x = torch.cat([img, depth_feat], dim=1)
+        return self.D(x)
+
+# -------- Depth feature aggregator: depth map -> C channels --------
+class DepthAgg(nn.Module):
+    """ depth map [B,1,H,W] -> depth feature [B,Cd,H,W] """
+    def __init__(self, out_ch=16):
+        super().__init__()
+        c = max(16, out_ch)
+        self.enc = nn.Sequential(
+            nn.Conv2d(1, c, 3, 1, 1), nn.InstanceNorm2d(c), nn.ReLU(True),
+            nn.Conv2d(c, out_ch, 3, 1, 1), nn.InstanceNorm2d(out_ch), nn.ReLU(True),
+        )
+
+    def forward(self, d01):
+        return self.enc(d01)  # [B,out_ch,H,W]
+
+
+# -------- D^cat wrapper: concat depth feature then run PatchGAN --------
+class DepthConcatD(nn.Module):
+    """
+    Wraps a PatchGAN D to take concat([img, depth_feat]) as input.
+    """
+    def __init__(self, base_D, depth_agg):
+        super().__init__()
+        self.D = base_D
+        self.depth_agg = depth_agg
+
+    def forward(self, img, depth01):
+        d_feat = self.depth_agg(depth01)
+        x = torch.cat([img, d_feat], dim=1)
+        return self.D(x)
 
 class UCLModel(BaseModel):
     """ This class implements UCL-Dehaze model
@@ -38,6 +292,25 @@ class UCLModel(BaseModel):
         parser.add_argument('--flip_equivariance',
                             type=util.str2bool, nargs='?', const=True, default=False,
                             help="Enforce flip-equivariance as additional regularization. It's used by FastCUT, but not UCL-Dehaze")
+
+        ## midas 'depth-concat PatchGAN' discriminator integration 
+        ## midas depth model options
+        parser.add_argument('--use_depth_cat', type=util.str2bool, nargs='?', const=True, default=False,
+                            help='enable Depth-Concat auxiliary discriminator (D^cat)')
+        parser.add_argument('--use_depth_cat_intermediate', type=util.str2bool, nargs='?', const=True, default=False,
+                            help='use DPT-Large middle features instead of depth map for D^cat')
+        parser.add_argument('--lambda_cat', type=float, default=0.3,
+                            help='weight for D^cat GAN loss in G update')
+        parser.add_argument('--depth_cat_channels', type=int, default=16,
+                            help='#channels of aggregated depth features fed to D^cat')
+        parser.add_argument('--midas_model', type=str, default='DPT_Large',
+                            help='MiDaS model type: DPT_Large (dpt_large_384)')
+        parser.add_argument('--midas_resize', type=int, default=384,
+                            help='shorter side for MiDaS transform (official dpt is 384)')
+        parser.add_argument('--midas_ckpt', type=str, default='',
+                            help='(optional) local .pt weight for offline use; if empty, use torch.hub')
+        parser.add_argument('--depth_cache_dir', type=str, default='',
+                            help='(optional) preload depth (.pt/.npy) if you want to skip on-the-fly MiDaS')
 
         parser.set_defaults(pool_size=0)  # no image pooling
 
@@ -93,6 +366,61 @@ class UCLModel(BaseModel):
             self.optimizers.append(self.optimizer_G)
             self.optimizers.append(self.optimizer_D)
 
+            ## midas 'depth-concat PatchGAN' discriminator integration 
+            if self.isTrain and getattr(opt, 'use_depth_cat', False):
+                # 1) MiDaS official (DPT_Large = dpt_large_384)
+                self.midas = MiDaSOfficial(model_type=opt.midas_model, img_size=opt.midas_resize, device=self.device)
+
+                # 2) D^cat: PatchGAN with input_nc = output_nc(=3) + depth_feat_channels
+                self.netD_cat = DepthConcatD(
+                    base_D = networks.define_D(
+                        opt.output_nc + opt.depth_cat_channels, opt.ndf, opt.netD, opt.n_layers_D,
+                        opt.normD, opt.init_type, opt.init_gain, opt.no_antialias, self.gpu_ids, opt
+                    ).to(self.device),
+                    depth_agg = DepthAgg(out_ch=opt.depth_cat_channels).to(self.device)
+                ).to(self.device)
+
+                # 3) Optimizer for D^cat
+                self.optimizer_D_cat = torch.optim.Adam(self.netD_cat.parameters(), lr=opt.lr, betas=(opt.beta1, opt.beta2))
+                self.optimizers.append(self.optimizer_D_cat)
+
+                # 4) logging
+                self.loss_names += ['D_cat_real', 'D_cat_fake', 'G_GAN_cat']
+                self.model_names.append('D_cat')
+
+            # ---- D^cat(중간 feature 기반) 구성 ----
+            if self.isTrain and getattr(opt, 'use_depth_cat_intermediate', False):
+                # 1) 커스텀 extractor (DPT-Large 공식 transform + 중간 feat 반환)
+                self.midas_extractor = MidasDPTExtractor(
+                    model_type=opt.midas_model,
+                    img_size=opt.midas_resize,
+                    device=self.device,
+                    local_ckpt_path=opt.midas_ckpt  # 빈 문자열이면 torch.hub 사용
+                )
+
+                # 2) FPN 융합기: p1..p4 -> [B,Cd,H,W]
+                self.depth_fpn = DepthFPNFuse(in_ch=256, out_ch=opt.depth_cat_channels).to(self.device)
+
+                # 3) 보조 D (RGB+depth_feat concat)
+                #    input_nc = RGB(3) + Cd
+                self.netD_cat = DepthFeatConcatD(
+                    base_D = networks.define_D(
+                        opt.output_nc + opt.depth_cat_channels, opt.ndf, opt.netD, opt.n_layers_D,
+                        opt.normD, opt.init_type, opt.init_gain, opt.no_antialias, self.gpu_ids, opt
+                    ).to(self.device)
+                ).to(self.device)
+
+                # 4) 옵티마이저 + 로깅
+                self.optimizer_D_cat = torch.optim.Adam(self.netD_cat.parameters(), lr=opt.lr, betas=(opt.beta1, opt.beta2))
+                self.optimizers.append(self.optimizer_D_cat)
+                self.loss_names += ['D_cat_real', 'D_cat_fake', 'G_GAN_cat']
+                self.model_names.append('D_cat')
+    
+    ## midas 'depth-concat PatchGAN' discriminator integration 
+    ## MiDaS 입력 준비 헬퍼
+    def _rgb_m11_to_01(self, t_rgbm11: torch.Tensor) -> torch.Tensor:
+        return (t_rgbm11 + 1.0) * 0.5
+
     def data_dependent_initialize(self, data):
         """
         The feature network netF is defined in terms of the shape of the intermediate, extracted
@@ -121,20 +449,42 @@ class UCLModel(BaseModel):
         # forward
         self.forward()
 
+        # ---- update D (RGB + optional D^cat) ----
+        ## final depth map 만 활용 /또는/ 중간 depth feature map 기반 /모두 공통/ 
         # update D
         self.set_requires_grad(self.netD, True)
+
+        ## midas 'depth-concat PatchGAN' discriminator integration 
+        if getattr(self, 'netD_cat', None) is not None:
+            self.set_requires_grad(self.netD_cat, True)
+
         self.optimizer_D.zero_grad()
+
+        ## midas 'depth-concat PatchGAN' discriminator integration 
+        if getattr(self, 'optimizer_D_cat', None) is not None:
+            self.optimizer_D_cat.zero_grad()
+
         self.loss_D = self.compute_D_loss()
         self.loss_D.backward()
         self.optimizer_D.step()
 
-        # update G
+        ## midas 'depth-concat PatchGAN' discriminator integration 
+        if getattr(self, 'optimizer_D_cat', None) is not None:
+            self.optimizer_D_cat.step()
+
+        # ---- update G ----
         self.set_requires_grad(self.netD, False)
+
+        ## midas 'depth-concat PatchGAN' discriminator integration 
+        if getattr(self, 'netD_cat', None) is not None:
+            self.set_requires_grad(self.netD_cat, False)
+
         self.optimizer_G.zero_grad()
         # if self.opt.netF == 'mlp_sample':
         # 호출 조건 강화
         if self.opt.netF == 'mlp_sample' and self.opt.lambda_NCE > 0.0 and hasattr(self, 'optimizer_F'):
             self.optimizer_F.zero_grad()
+
         self.loss_G = self.compute_G_loss()
         self.loss_G.backward()
         self.optimizer_G.step()
@@ -171,6 +521,8 @@ class UCLModel(BaseModel):
     def compute_D_loss(self):
         """Calculate GAN loss for the discriminator"""
         fake = self.fake_B.detach()
+
+        # ---- main RGB D ----
         # Fake; stop backprop to the generator by detaching fake_B
         pred_fake = self.netD(fake)
         self.loss_D_fake = self.criterionGAN(pred_fake, False).mean()      # LS_GAN MSE loss
@@ -181,23 +533,64 @@ class UCLModel(BaseModel):
 
         # combine loss and calculate gradients
         self.loss_D = (self.loss_D_fake + self.loss_D_real) * 0.5
+
+        ## midas 'depth-concat PatchGAN' discriminator integration 
+        # ---- auxiliary D^cat ----
+        if getattr(self.opt, 'use_depth_cat', False):
+            with torch.no_grad():
+                d_fake = self.midas(fake)       # official transform inside
+                d_real = self.midas(self.real_B)
+
+            pred_fake_cat = self.netD_cat(fake, d_fake)
+            pred_real_cat = self.netD_cat(self.real_B, d_real)
+            self.loss_D_cat_fake = self.criterionGAN(pred_fake_cat, False).mean()
+            self.loss_D_cat_real = self.criterionGAN(pred_real_cat,  True).mean()
+            self.loss_D_cat = 0.5 * (self.loss_D_cat_fake + self.loss_D_cat_real)
+
+            self.loss_D = self.loss_D + self.loss_D_cat
+
+        # ---- 보조 D^cat (MiDaS 중간 feature 기반) ----
+        if getattr(self.opt, 'use_depth_cat_intermediate', False):
+            with torch.no_grad():
+                # 중간 feat 추출 (공식 transform 포함)
+                _, feats_fake = self.midas_extractor(self.fake_B.detach())
+                _, feats_real = self.midas_extractor(self.real_B)
+
+                # p1..p4 -> [B,Cd,H,W]
+                H, W = self.real_B.shape[-2:]
+                dfeat_fake = self.depth_fpn(feats_fake, target_hw=(H,W))
+                dfeat_real = self.depth_fpn(feats_real, target_hw=(H,W))
+
+            pred_fake_cat = self.netD_cat(self.fake_B.detach(), dfeat_fake.detach())
+            pred_real_cat = self.netD_cat(self.real_B,          dfeat_real)
+
+            self.loss_D_cat_fake = self.criterionGAN(pred_fake_cat, False).mean()
+            self.loss_D_cat_real = self.criterionGAN(pred_real_cat,  True).mean()
+            self.loss_D_cat = 0.5 * (self.loss_D_cat_fake + self.loss_D_cat_real)
+
+            self.loss_D = self.loss_D + self.loss_D_cat
+
         return self.loss_D
 
     def compute_G_loss(self):
         """Calculate GAN and NCE loss for the generator"""
         fake = self.fake_B
-        # First, G(A) should fake the discriminator
+
+        # ---- main RGB GAN ----
+        ## First, G(A) should fake the discriminator
         if self.opt.lambda_GAN > 0.0:
             pred_fake = self.netD(fake)
             self.loss_G_GAN = self.criterionGAN(pred_fake, True).mean() * self.opt.lambda_GAN
         else:
             self.loss_G_GAN = 0.0
 
+        ## NCE (X->G(X))
         if self.opt.lambda_NCE > 0.0:
             self.loss_NCE = self.calculate_NCE_loss(self.real_A, self.fake_B)    # input & generated
         else:
             self.loss_NCE, self.loss_NCE_bd = 0.0, 0.0
 
+        ## NCE_Y and IDT
         if self.opt.nce_idt and self.opt.lambda_NCE > 0.0:
             # self.loss_NCE_Y = 0
             # 0813 수정사항 
@@ -213,10 +606,31 @@ class UCLModel(BaseModel):
             if not hasattr(self, 'loss_NCE_Y'):
                 self.loss_NCE_Y = torch.tensor(0.0, device=self.device)
 
+        ## SCP
         # self.loss_perceptual = self.perceptual_loss(self.real_A, self.fake_B, self.real_B) * 0.0002
         self.loss_perceptual = self.perceptual_loss(self.real_A, self.fake_B, self.real_B) * self.opt.lambda_SCP
 
-        self.loss_G = self.loss_G_GAN + loss_NCE_both + self.loss_idt + self.loss_perceptual
+        # ---- D^cat: encourage fake to be real under depth-concat D ----
+        ## midas 'depth-concat PatchGAN' discriminator integration 
+        self.loss_G_GAN_cat = torch.tensor(0.0, device=self.device)
+        if getattr(self.opt, 'use_depth_cat', False):
+            with torch.no_grad():
+                d_fake = self.midas(self.fake_B)  # official transform inside
+            pred_fake_cat_g = self.netD_cat(self.fake_B, d_fake)
+            self.loss_G_GAN_cat = self.criterionGAN(pred_fake_cat_g, True).mean() * self.opt.lambda_cat
+
+        if getattr(self.opt, 'use_depth_cat_intermediate', False):
+            with torch.no_grad():
+                _, feats_fake = self.midas_extractor(self.fake_B)
+                H, W = self.fake_B.shape[-2:]
+                dfeat_fake = self.depth_fpn(feats_fake, target_hw=(H,W))
+
+            pred_fake_cat_g = self.netD_cat(self.fake_B, dfeat_fake)
+            self.loss_G_GAN_cat = self.criterionGAN(pred_fake_cat_g, True).mean() * self.opt.lambda_cat
+
+        ## midas 'depth-concat PatchGAN' discriminator integration
+        # self.loss_G = self.loss_G_GAN + loss_NCE_both + self.loss_idt + self.loss_perceptual
+        self.loss_G = self.loss_G_GAN + self.loss_G_GAN_cat + loss_NCE_both + self.loss_idt + self.loss_perceptual
         return self.loss_G
 
     def perceptual_loss(self, x, y, z):
