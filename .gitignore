@@ -10,3 +10,6 @@ visualizations/
 
 # local utils
 check_gpu.py
+
+# train logs
+*.log

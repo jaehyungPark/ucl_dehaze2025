@@ -16,3 +16,6 @@ dependencies:
   - GPUtil==1.4.0
 
   # conda create -n ucl python=3.6 
+  ## -> and pip install dependencies.
+  # OR
+  # # conda env create -f environment.yml
